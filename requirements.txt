@@ -3,3 +3,4 @@ requests
 pyngrok
 transformers
 gunicorn
+torch
