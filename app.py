@@ -4,6 +4,7 @@ import requests
 
 # Initialize Flask app
 app = Flask(__name__)
+CORS(app)
 
 # Load NLP model
 ner_pipeline = pipeline("ner", model="dslim/bert-base-NER")
