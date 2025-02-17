@@ -1,12 +1,14 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from transformers import pipeline
 import requests
+from geopy.distance import geodesic
 
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app)
 
-# Load NLP model
+# Load NLP model for location extraction
 ner_pipeline = pipeline("ner", model="dslim/bert-base-NER")
 
 def extract_location(text):
@@ -24,18 +26,38 @@ def get_location_coordinates(place):
     if response.status_code == 200 and response.text.strip():
         data = response.json()
         if data:
-            return data[0]["lat"], data[0]["lon"]
+            return float(data[0]["lat"]), float(data[0]["lon"])
     return None, None
 
-def get_nearby_places(place, category):
-    """Finds nearby places (hospitals, schools, etc.)"""
-    url = f"https://nominatim.openstreetmap.org/search?q={category}+in+{place}&format=json"
+def get_nearby_places(place, category, radius=5):
+    """Finds nearby places of a given category and filters them by distance"""
+    lat, lon = get_location_coordinates(place)
+    if not lat or not lon:
+        return []
+
+    search_query = f"{category} in {place}"
+    url = f"https://nominatim.openstreetmap.org/search?q={search_query}&format=json"
     headers = {"User-Agent": "Mozilla/5.0"}
-    
     response = requests.get(url, headers=headers)
+    
     if response.status_code == 200:
         data = response.json()
-        return [{"name": p["display_name"], "lat": p["lat"], "lon": p["lon"]} for p in data[:5]]
+        nearby_places = [
+            {
+                "name": p["display_name"],
+                "lat": float(p["lat"]),
+                "lon": float(p["lon"]),
+                "maps_link": f"https://www.google.com/maps/search/?api=1&query={p['lat']},{p['lon']}"
+            }
+            for p in data
+        ]
+
+        # Filter places by distance
+        filtered_places = [
+            p for p in nearby_places
+            if geodesic((lat, lon), (p["lat"], p["lon"])).km <= radius
+        ]
+        return filtered_places[:10]
     
     return []
 
@@ -64,8 +86,9 @@ def query_nearby():
     data = request.json
     place = data.get('place', '')
     category = data.get('category', '')
+    radius = data.get('radius', 5)  # Default radius: 5 km
 
-    places = get_nearby_places(place, category)
+    places = get_nearby_places(place, category, radius)
     return jsonify({"nearby_places": places})
 
 # Run the app using Gunicorn for production
