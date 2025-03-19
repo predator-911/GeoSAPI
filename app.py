@@ -22,10 +22,18 @@ app.add_middleware(
 # Load NLP model for location extraction
 ner_pipeline = pipeline("ner", model="dslim/bert-base-NER")
 
+# Fetch MongoDB credentials from environment variables
+MONGO_USERNAME = os.getenv("MONGO_USERNAME")
+MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
+MONGO_DB = os.getenv("MONGO_DB")
+
+if not MONGO_USERNAME or not MONGO_PASSWORD or not MONGO_DB:
+    raise ValueError("MongoDB credentials (MONGO_USERNAME, MONGO_PASSWORD, MONGO_DB) are not set in environment variables")
+
 # Connect to MongoDB Atlas
-MONGO_URI = os.getenv("MONGO_URI", f"mongodb+srv://{MONGO_USERNAME}:{MONGO_PASSWORD}@cluster0.38cb2.mongodb.net/{MONGO_DB}?retryWrites=true&w=majority")
+MONGO_URI = f"mongodb+srv://{MONGO_USERNAME}:{MONGO_PASSWORD}@cluster0.38cb2.mongodb.net/{MONGO_DB}?retryWrites=true&w=majority"
 client = pymongo.MongoClient(MONGO_URI, tlsCAFile=certifi.where())
-db = client["Fashin_db"]  # Database Name
+db = client[MONGO_DB]  # Database Name
 crime_collection = db["CrimeData"]
 
 # Function to extract locations from text
