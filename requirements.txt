@@ -1,9 +1,10 @@
-flask
-flask_cors
+fastapi
+uvicorn
 requests
-pyngrok
+pymongo
+certifi
 transformers
-gunicorn
 torch
 geopy
+gunicorn
 waitress
