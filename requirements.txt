@@ -12,7 +12,7 @@ spacy
 folium
 whisper
 openai
-https
+httpx
 h3
 geopy
 cachetools
