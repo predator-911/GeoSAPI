@@ -1,128 +1,152 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from transformers import pipeline
-import requests
+# Install necessary libraries
+import re
+import json
+import folium
+import spacy
+import whisper
+import httpx
+import h3
 from geopy.distance import geodesic
-import pymongo
+from geopy.point import Point
+from cachetools import TTLCache
+from pymongo import MongoClient, GEOSPHERE
+from pydantic import BaseModel
 import certifi
-import os
+import asyncio
+from fastapi import FastAPI
+
+# Load spaCy model and add an entity ruler for geospatial relations
+from spacy.pipeline import EntityRuler
 
 # Initialize FastAPI app
 app = FastAPI()
 
-# Enable CORS (For frontend communication)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Load NLP model
+nlp = spacy.load("en_core_web_sm")
+ruler = nlp.add_pipe("entity_ruler")
 
-# Load NLP model for location extraction
-ner_pipeline = pipeline("ner", model="dslim/bert-base-NER")
+# Define patterns for geospatial relations
+patterns = [
+    {
+        "label": "GEO_RELATION",
+        "pattern": [{"LOWER": {"IN": ["within", "near", "adjacent"]}}, {"OP": "*"}, {"ENT_TYPE": "QUANTITY"}]
+    }
+]
+ruler.add_patterns(patterns)
 
-# Fetch MongoDB credentials from environment variables
-MONGO_USERNAME = os.getenv("MONGO_USERNAME")
-MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
-MONGO_DB = os.getenv("MONGO_DB")
+# Load Whisper model for voice transcription
+whisper_model = whisper.load_model("base")
 
-if not MONGO_USERNAME or not MONGO_PASSWORD or not MONGO_DB:
-    raise ValueError("MongoDB credentials (MONGO_USERNAME, MONGO_PASSWORD, MONGO_DB) are not set in environment variables")
+# In-memory cache
+cache = TTLCache(maxsize=100, ttl=600)
 
-# Connect to MongoDB Atlas
-MONGO_URI = f"mongodb+srv://{MONGO_USERNAME}:{MONGO_PASSWORD}@cluster0.38cb2.mongodb.net/{MONGO_DB}?retryWrites=true&w=majority"
-client = pymongo.MongoClient(MONGO_URI, tlsCAFile=certifi.where())
-db = client[MONGO_DB]  # Database Name
-crime_collection = db["CrimeData"]
+# MongoDB setup
+username = "DRM_1"
+password = "JKfMSCgDzfaUC3bZ"
+uri = f"mongodb+srv://{username}:{password}@cluster0.38cb2.mongodb.net/?retryWrites=true&w=majority"
 
-# Function to extract locations from text
-def extract_location(text: str):
-    results = ner_pipeline(text)
-    locations = [r["word"] for r in results if "LOC" in r["entity"]]
-    return locations
+try:
+    mongo_client = MongoClient(uri, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
+    db = mongo_client["geospatialDB"]
+    custom_locations = db["locations"]
+    custom_locations.create_index([("location", GEOSPHERE)])
+    print("MongoDB connected successfully!")
+except Exception as e:
+    custom_locations = None
+    print("MongoDB connection failed:", str(e))
 
-# Function to get coordinates from OpenStreetMap
-def get_location_coordinates(place: str):
-    url = f"https://nominatim.openstreetmap.org/search?q={place}&format=json"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200 and response.text.strip():
-        data = response.json()
-        if data:
-            return float(data[0]["lat"]), float(data[0]["lon"])
-    return None, None
+# API Endpoints
+OSM_NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OSM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
+OSRM_ROUTE_URL = "http://router.project-osrm.org/route/v1/driving/"
 
-# Function to get nearby places using Overpass API
-def get_nearby_places(place: str, category: str, radius: int = 5):
-    lat, lon = get_location_coordinates(place)
-    if not lat or not lon:
-        return []
+# ---------------------------
+# Helper Functions
+# ---------------------------
 
-    overpass_url = "http://overpass-api.de/api/interpreter"
-    query = f"""
-    [out:json];
-    node
-      ["amenity"="{category}"]
-      (around:{radius * 1000},{lat},{lon});
-    out;
-    """
-    
-    response = requests.get(overpass_url, params={"data": query})
-    
-    if response.status_code == 200:
-        data = response.json()
-        nearby_places = [
-            {
-                "name": f"Place {i+1}",
-                "lat": p["lat"],
-                "lon": p["lon"],
-                "maps_link": f"https://www.openstreetmap.org/?mlat={p['lat']}&mlon={p['lon']}"
-            }
-            for i, p in enumerate(data.get("elements", []))
-        ]
-        return nearby_places[:10]
-    
-    return []
+def advanced_parse_query(query: str):
+    """Parses a natural language query for geospatial relations."""
+    doc = nlp(query)
+    entities = [ent.text for ent in doc.ents if ent.label_ in ["GPE", "LOC"]]
+    primary_location = entities[0] if entities else None
 
-# Function to get crime data for a location
-def get_crime_data(place: str):
-    lat, lon = get_location_coordinates(place)
-    if not lat or not lon:
-        return {"error": "Invalid location"}
+    distance_match = re.search(r"(\d+(?:.\d+)?)\s*km", query, re.IGNORECASE)
+    distance = float(distance_match.group(1)) if distance_match else None
 
-    crime_entry = crime_collection.find_one({"place": place})
-    if crime_entry:
-        return {"place": place, "crime_level": crime_entry["crime_level"]}
+    direction_match = re.search(r"(north|south|east|west)\s+of", query, re.IGNORECASE)
+    direction = direction_match.group(1).lower() if direction_match else None
 
-    return {"place": place, "crime_level": "Unknown"}
+    poi_keywords = ["restaurant", "hospital", "park", "school", "forest", "museum", "airport"]
+    category = next((token.lemma_.lower() for token in doc if token.lemma_.lower() in poi_keywords), None)
 
-# Root Endpoint
+    return {"entity": primary_location, "distance": distance, "direction": direction, "category": category}
+
+async def geocode_location(location: str):
+    """Geocodes a location using OpenStreetMap."""
+    if location in cache:
+        return cache[location]
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(OSM_NOMINATIM_URL, params={"q": location, "format": "json"})
+        if response.status_code == 200 and response.json():
+            coords = {"lat": float(response.json()[0]['lat']), "lon": float(response.json()[0]['lon'])}
+            cache[location] = coords
+            return coords
+    return None
+
+def adjust_coordinates(coords, direction, distance_km):
+    """Adjusts coordinates based on direction and distance."""
+    origin = Point(coords["lat"], coords["lon"])
+    directions = {"north": 0, "east": 90, "south": 180, "west": 270}
+    bearing = directions.get(direction.lower(), 0)
+    adjusted = geodesic(kilometers=distance_km).destination(origin, bearing=bearing)
+    return {"lat": adjusted.latitude, "lon": adjusted.longitude}
+
+def compute_h3_index(coords, resolution: int = 8):
+    """Computes the H3 index for a given location."""
+    return h3.latlng_to_cell(coords["lat"], coords["lon"], resolution)
+
+# ---------------------------
+# FastAPI Endpoints
+# ---------------------------
+
 @app.get("/")
-def home():
-    return {"message": "FastAPI server is running on Render! Use /query, /nearby, and /crime endpoints."}
+async def root():
+    return {"message": "Geospatial API is running!"}
 
-# Endpoint to extract location and find coordinates
-@app.post("/query")
-def query_location(text: str):
-    locations = extract_location(text)
-    if not locations:
-        raise HTTPException(status_code=400, detail="No location found")
+@app.get("/parse_query/")
+async def parse_query(query: str):
+    """Parses a natural language query."""
+    return advanced_parse_query(query)
 
-    place = locations[0]
-    lat, lon = get_location_coordinates(place)
+@app.get("/geocode/")
+async def get_geocode(location: str):
+    """Returns geocoded coordinates of a location."""
+    coords = await geocode_location(location)
+    return {"location": location, "coordinates": coords} if coords else {"error": "Location not found"}
 
-    return {"place": place, "latitude": lat, "longitude": lon}
+@app.get("/adjust_coordinates/")
+async def get_adjusted_coordinates(location: str, direction: str, distance: float):
+    """Adjusts coordinates based on distance and direction."""
+    coords = await geocode_location(location)
+    if coords:
+        adjusted = adjust_coordinates(coords, direction, distance)
+        return {"original": coords, "adjusted": adjusted}
+    return {"error": "Location not found"}
 
-# Endpoint to find nearby places
-@app.post("/nearby")
-def query_nearby(place: str, category: str, radius: int = 5):
-    places = get_nearby_places(place, category, radius)
-    return {"nearby_places": places}
+@app.get("/h3_index/")
+async def get_h3_index(location: str):
+    """Returns the H3 index for a given location."""
+    coords = await geocode_location(location)
+    if coords:
+        h3_index = compute_h3_index(coords)
+        return {"location": location, "h3_index": h3_index}
+    return {"error": "Location not found"}
 
-# Endpoint to get crime data for a location
-@app.post("/crime")
-def query_crime(place: str):
-    crime_info = get_crime_data(place)
-    return crime_info
+# ---------------------------
+# Run the FastAPI App
+# ---------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
