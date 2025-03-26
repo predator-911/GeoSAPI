@@ -10,10 +10,9 @@ gunicorn
 waitress
 spacy
 folium
-whisper
+openai-whisper  # ✅ Correct Whisper package
 openai
 httpx
 h3
-geopy
 cachetools
 pydantic
