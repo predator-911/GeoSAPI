@@ -1,18 +1,7 @@
-fastapi
-uvicorn
-requests
-pymongo
-certifi
-transformers
-torch
-geopy
-gunicorn
-waitress
-spacy
-folium
-openai-whisper  # ✅ Correct Whisper package
-openai
-httpx
-h3
-cachetools
-pydantic
+fastapi==0.109.0
+uvicorn==0.27.0
+geopy==2.3.0
+requests==2.31.0
+spacy==3.7.2
+en-core-web-md @ https://github.com/explosion/spacy-models/releases/download/en_core_web_md-3.7.0/en_core_web_md-3.7.0-py3-none-any.whl
+python-dotenv==1.0.0
